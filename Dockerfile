@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-#
 # 多阶段构建：前端静态导出 → Go 单二进制（内嵌前端）→ 运行镜像。
 # 原 Docker Hub 镜像源（autumn27/artex）已失效，本仓库自此支持从纯源码自助构建：
 #   docker compose build        # 或 docker build -t artex:local .
@@ -26,6 +24,13 @@ ARG TARGETARCH
 ARG GOPROXY=https://goproxy.cn,https://proxy.golang.org,direct
 WORKDIR /src
 COPY go.mod go.sum ./
+# go.mod 里有 `replace github.com/Autumn-27/norma => ./norma`（上游闭源，改成本地目录）。
+# go mod download 加载依赖图时必须读 ./norma/go.mod；这里只拷了 go.mod/go.sum，
+# 目录不存在，构建会以 exit code 1 失败，报：
+#   ... (replaced by ./norma): reading norma/go.mod: no such file or directory
+# 所以先带入 norma/。放在 download 之前既修掉报错，也保住依赖缓存层：
+# 只改源码时不会重新下载模块。
+COPY norma ./norma
 RUN go mod download
 COPY . .
 # 前端静态产物从 web 阶段拷入（.dockerignore 已排除宿主 dist，不会冲突）
@@ -39,13 +44,23 @@ ARG NPM_REGISTRY=https://registry.npmmirror.com
 ENV npm_config_registry=$NPM_REGISTRY \
     PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright
 # 常用工具：ripgrep / curl / vim，加一批 recon 常备件（按需增删）。
-# Node 从 NodeSource 装 20.x：bookworm 自带的 apt nodejs 是 18，Playwright 要求 >=20。
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates ripgrep curl wget vim git jq unzip \
       dnsutils iputils-ping netcat-openbsd inetutils-telnet whois nmap \
-    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
+# Node 20 直接从阶段 1 的 node:20-bookworm 复制，不再在容器里访问 deb.nodesource.com。
+# 原来的 `curl -fsSL https://deb.nodesource.com/setup_20.x | bash -` 有两个坑：
+#   1) /bin/sh 没有 pipefail，curl 失败时整条管道的退出码仍是 `bash -` 的 0，
+#      脚本没执行、NodeSource 源没加上，构建看起来却成功了；
+#   2) 源没加上时 apt 退回 Debian 的 nodejs 18，而 Debian 的 nodejs 包
+#      只含 /usr/bin/node、/usr/bin/nodejs，不含 npm。
+# 两者叠加的结果就是下一个 RUN 直接 `npm: not found` → exit code 127。
+# 改为复制后 Node 版本固定为 20，且整层不再依赖外网。
+COPY --from=web /usr/local/bin/node /usr/local/bin/node
+COPY --from=web /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
+RUN ln -sf ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+    && ln -sf ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
+    && node --version && npm --version
 # 预装 Playwright MCP 与 CLI（全局），运行时不再 npx 联网下载。
 # @playwright/mcp：browser MCP 直接 `npx @playwright/mcp`（已全局装好，无需 -y/@latest）。
 # @playwright/cli：提供 playwright-cli，装完顺带 --help 验证可执行。
